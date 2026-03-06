@@ -1,30 +1,59 @@
-// Package cache mengimplementasikan mekanisme Auto-Cache Adaptif
-// dengan fitur-fitur lanjutan:
+// Package cache mengimplementasikan Auto-Cache Adaptif berbasis tiga pilar:
 //
-//  1. JENDELA WAKTU AKTIF (Active Window)
-//     Cache hanya aktif pada rentang 06:30 – 24:00.
-//     Di luar jendela ini, setiap request langsung ke database (cache dilewati).
+// ══════════════════════════════════════════════════════════════════════════════
 //
-//  2. TRACKING FREKUENSI PER-KEY
-//     Setiap key dicatat jumlah hit dan total durasi aktifnya selama satu siklus.
-//     Data ini digunakan sebagai dasar evaluasi bulanan.
+//	TIGA PILAR ALGORITMA
 //
-//  3. EVALUASI SIKLUS BULANAN (30 Hari)
-//     Pada akhir setiap siklus 30 hari, sistem mengevaluasi pola akses:
-//     - Key FREKUENSI TINGGI  → TTL diperpanjang + masuk daftar pre-cache
-//     - Key FREKUENSI RENDAH  → TTL dipersingkat atau tidak di-cache (skip)
+// ══════════════════════════════════════════════════════════════════════════════
 //
-//  4. ALGORITMA TTL ADAPTIF
-//     TTL_runtime = TTL_key + f(D)
-//     D           = t_now − entry.T0
-//     f(D)        = AdaptCoeff × D
-//     TTL dibatasi oleh TTL_max.
+//	PILAR 1 — AKSES AWAL (First Access Time)
+//	  Setiap hari, system mencatat JAM PERTAMA kali setiap key diakses.
+//	  Contoh: key "products:all" pertama kali diakses pukul 06:30 setiap hari.
+//	  → Pada bulan berikutnya, cache di-PRE-WARM otomatis pada jam yang sama
+//	    sebelum pengguna datang, sehingga request pertama sudah HIT.
+//	  → AvgFirstAccessHour & AvgFirstAccessMinute dihitung dari rata-rata
+//	    jam akses pertama harian selama sebulan.
 //
-//  5. KLASIFIKASI KEY
-//     HIGH   : hit ≥ HighFreqThreshold → TTL_key = TTL_baseline × HighMultiplier
-//     MEDIUM : hit ≥ LowFreqThreshold  → TTL_key = TTL_baseline (tidak berubah)
-//     LOW    : hit < LowFreqThreshold  → TTL_key = TTL_baseline × LowMultiplier
-//     (atau skip cache jika SkipLowFreq = true)
+//	PILAR 2 — CACHE HIT (Data Populer)
+//	  Hanya key yang BENAR-BENAR diakses (HitCount > 0) yang masuk daftar
+//	  "hot key" — kandidat autocache bulan depan.
+//	  → Key dengan hit lebih banyak = prioritas lebih tinggi.
+//	  → Key yang tidak pernah di-hit tidak di-cache bulan depan.
+//
+//	PILAR 3 — DURASI CACHE (Active Duration)
+//	  Durasi = LastAccessTime − FirstAccessTime dalam sebulan.
+//	  Ini mencerminkan "seberapa lama data ini aktif digunakan."
+//	  → Durasi ini menjadi TTL key tersebut di bulan berikutnya.
+//	  → Semakin lama data dipakai, semakin lama pula ia di-cache bulan depan.
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//	ALUR LENGKAP
+//
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//	[Bulan Berjalan]
+//	  Setiap cache HIT pada key K:
+//	    1. Catat jam akses pertama hari ini → DailyFirstAccess[tanggal]
+//	    2. Perbarui LastAccessTime
+//	    3. Tambah HitCount
+//	    4. Hitung TTL_runtime = TTL_baseline + AdaptCoeff × D_key
+//	       (D_key = LastAccess − FirstAccess key ini bulan ini)
+//
+//	[Evaluasi Pergantian Bulan]
+//	  Untuk setiap key yang pernah di-hit:
+//	    AvgFirstHour   = rata-rata jam pertama akses harian
+//	    AvgFirstMinute = rata-rata menit pertama akses harian
+//	    SuggestedTTL   = LastAccessTime − FirstAccessTime (durasi aktif bulan ini)
+//	    → Simpan sebagai HotKeyProfile
+//
+//	[Bulan Berikutnya]
+//	  WarmupScheduler berjalan setiap menit:
+//	    Jika jam sekarang = AvgFirstHour:AvgFirstMinute suatu hot key
+//	      → Panggil WarmupFunc(key) → ambil data dari DB → simpan ke cache
+//	      → Cache sudah siap SEBELUM pengguna datang
+//
+// ══════════════════════════════════════════════════════════════════════════════
 package cache
 
 import (
@@ -38,134 +67,123 @@ import (
 // ── Konstanta ──────────────────────────────────────────────────────────────────
 
 const (
-	// TTL dasar saat sistem pertama kali berjalan
-	DefaultTTLBaseline = 5 * time.Minute
-
-	// Batas maksimum TTL yang diizinkan
-	DefaultTTLMax = 1 * time.Hour
-
-	// Koefisien adaptasi linier:
-	// per detik D → TTL bertambah DefaultAdaptCoeff detik
-	DefaultAdaptCoeff = 0.001
-
-	// Ambang batas frekuensi hit per siklus untuk klasifikasi
-	HighFreqThreshold = 50 // ≥ 50 hit → HIGH
-	LowFreqThreshold  = 10 // < 10 hit → LOW
-
-	// Pengali TTL per klasifikasi
-	HighFreqMultiplier = 3.0 // HIGH  → TTL × 3
-	LowFreqMultiplier  = 0.5 // LOW   → TTL × 0.5
-
-	// Apakah key LOW langsung diskip dari cache?
-	SkipLowFreqDefault = false
-
-	// Interval pembersihan entry kadaluarsa
-	CleanupInterval = 1 * time.Minute
-
-	// Interval evaluasi siklus bulanan
-	EvalCycleInterval = 30 * 24 * time.Hour
-
-	// Jendela aktif cache (HH:MM)
-	ActiveWindowStart = "06:30"
-	ActiveWindowEnd   = "24:00"
+	DefaultTTLBaseline  = 5 * time.Minute
+	DefaultTTLMax       = 4 * time.Hour
+	DefaultAdaptCoeff   = 0.002
+	CleanupInterval     = 1 * time.Minute
+	WarmupCheckInterval = 1 * time.Minute // interval cek jadwal pre-warm
 )
 
-// ── Klasifikasi Frekuensi ──────────────────────────────────────────────────────
+// ── Tipe Callback ──────────────────────────────────────────────────────────────
 
-// FreqClass merepresentasikan klasifikasi frekuensi akses sebuah key.
-type FreqClass string
+// WarmupFunc adalah fungsi yang dipanggil saat pre-warm cache.
+// Implementasinya ada di handler — mengambil data dari DB berdasarkan key.
+type WarmupFunc func(key string) (interface{}, error)
 
-const (
-	FreqHigh   FreqClass = "HIGH"
-	FreqMedium FreqClass = "MEDIUM"
-	FreqLow    FreqClass = "LOW"
-)
+// ── Struktur Data Per-Key ──────────────────────────────────────────────────────
 
-// ── Statistik Per-Key ──────────────────────────────────────────────────────────
-
-// KeyStat menyimpan statistik akses satu key selama satu siklus evaluasi.
-type KeyStat struct {
-	Key           string        `json:"key"`
-	HitCount      int64         `json:"hit_count"`
-	MissCount     int64         `json:"miss_count"`
-	TotalDuration time.Duration `json:"total_active_duration_ns"`
-	Class         FreqClass     `json:"class"`
-	AssignedTTL   time.Duration `json:"assigned_ttl_ns"`
-	SkipCache     bool          `json:"skip_cache"`
-	LastAccess    time.Time     `json:"last_access"`
+// dailyRecord mencatat aktivitas satu key pada satu hari tertentu.
+type dailyRecord struct {
+	Date      string    // format: "2006-01-02"
+	FirstTime time.Time // jam pertama kali key ini diakses hari itu (Pilar 1)
+	LastTime  time.Time // jam terakhir key ini diakses hari itu
+	Hits      int64     // jumlah hit hari ini
 }
 
-// ── CacheEntry ─────────────────────────────────────────────────────────────────
+// keyMonthlyStats mengumpulkan statistik satu key selama satu bulan penuh.
+type keyMonthlyStats struct {
+	Key             string
+	Month           int
+	Year            int
+	FirstAccessEver time.Time               // akses pertama key ini bulan ini
+	LastAccessEver  time.Time               // akses terakhir key ini bulan ini
+	TotalHits       int64                   // total hit bulan ini (Pilar 2)
+	DailyRecords    map[string]*dailyRecord // key: "2006-01-02" (Pilar 1 per hari)
+}
 
-// CacheEntry menyimpan satu item beserta metadata temporalnya.
+// HotKeyProfile adalah hasil evaluasi bulanan untuk satu key.
+// Profil ini dipakai bulan depan untuk menentukan kapan & berapa lama cache.
+type HotKeyProfile struct {
+	Key               string        `json:"key"`
+	HitCountLastMonth int64         `json:"hit_count_last_month"`    // Pilar 2
+	AvgFirstHour      int           `json:"avg_first_access_hour"`   // Pilar 1
+	AvgFirstMinute    int           `json:"avg_first_access_minute"` // Pilar 1
+	SuggestedTTL      time.Duration `json:"suggested_ttl"`           // Pilar 3
+	ActiveDurationSec float64       `json:"active_duration_seconds"` // Pilar 3
+	EvalMonth         string        `json:"eval_month"`
+	warmedUpToday     bool          // flag internal: sudah di-warm hari ini?
+	lastWarmDate      string        // tanggal terakhir di-warm
+}
+
+// ── Struktur Cache Entry ───────────────────────────────────────────────────────
+
+// CacheEntry menyimpan data beserta metadata tracking per-key.
 type CacheEntry struct {
 	Value    interface{}
-	ExpireAt time.Time // t_expire = t_set + TTL_runtime
-	T0       time.Time // waktu entry pertama kali disimpan ke cache
-	HitCount int64     // jumlah hit pada entry ini
+	ExpireAt time.Time
+	stats    *keyMonthlyStats // pointer ke stats bulan ini
 }
 
-// ── CacheStats ─────────────────────────────────────────────────────────────────
+// ── Statistik & Snapshot ───────────────────────────────────────────────────────
 
-// CacheStats berisi ringkasan lengkap kondisi cache untuk satu siklus.
+// MonthlyEvalSnapshot menyimpan ringkasan evaluasi satu bulan.
+type MonthlyEvalSnapshot struct {
+	Month        string          `json:"month"`
+	HotKeysFound int             `json:"hot_keys_found"`
+	Profiles     []HotKeyProfile `json:"hot_key_profiles"`
+	EvaluatedAt  time.Time       `json:"evaluated_at"`
+}
+
+// CacheStats berisi statistik lengkap sistem.
 type CacheStats struct {
-	// Kondisi saat ini
-	ItemCount       int     `json:"item_count"`
-	TotalHits       int64   `json:"total_hits"`
-	TotalMisses     int64   `json:"total_misses"`
-	HitRatioPct     float64 `json:"hit_ratio_pct"`
-	AvgDurationSec  float64 `json:"avg_entry_duration_seconds"`
-	AvgActiveTTLSec float64 `json:"avg_active_ttl_seconds"`
+	ItemCount      int                   `json:"item_count"`
+	TotalHits      int64                 `json:"total_hits"`
+	TotalMisses    int64                 `json:"total_misses"`
+	HitRatioPct    float64               `json:"hit_ratio_pct"`
+	CurrentMonth   string                `json:"current_month"`
+	TTLBaselineSec float64               `json:"ttl_baseline_seconds"`
+	TTLMaxSec      float64               `json:"ttl_max_seconds"`
+	AdaptCoeff     float64               `json:"adapt_coeff"`
+	CleanupCount   int64                 `json:"entries_cleaned_total"`
+	HotKeyProfiles []HotKeyProfile       `json:"hot_key_profiles_next_month"`
+	MonthlyHistory []MonthlyEvalSnapshot `json:"monthly_eval_history"`
+	ActiveKeyStats []ActiveKeyStat       `json:"active_key_stats"`
+}
 
-	// Parameter adaptif
-	TTLBaselineSec float64 `json:"ttl_baseline_seconds"`
-	TTLMaxSec      float64 `json:"ttl_max_seconds"`
-	AdaptCoeff     float64 `json:"adapt_coeff"`
-
-	// Jendela aktif
-	ActiveWindowStart string `json:"active_window_start"`
-	ActiveWindowEnd   string `json:"active_window_end"`
-	IsWindowActive    bool   `json:"is_window_active_now"`
-	WindowStatus      string `json:"window_status"`
-
-	// Siklus evaluasi
-	CleanupCount int64     `json:"entries_cleaned_this_cycle"`
-	CycleStart   time.Time `json:"cycle_start_t0"`
-	LastEvalTime time.Time `json:"last_eval_time"`
-	NextEvalTime time.Time `json:"next_eval_time"`
-
-	// Statistik per-key hasil evaluasi
-	KeyStats     []KeyStat `json:"key_stats"`
-	HighFreqKeys []string  `json:"high_freq_keys"`
-	LowFreqKeys  []string  `json:"low_freq_keys"`
-	SkippedKeys  []string  `json:"skipped_keys"`
+// ActiveKeyStat adalah ringkasan statistik key yang saat ini aktif di cache.
+type ActiveKeyStat struct {
+	Key               string  `json:"key"`
+	HitCount          int64   `json:"hit_count_this_month"`
+	ActiveDurationSec float64 `json:"active_duration_seconds"`
+	AvgFirstHour      int     `json:"avg_first_access_hour"`
+	AvgFirstMinute    int     `json:"avg_first_access_minute"`
+	TTLRemainingSec   float64 `json:"ttl_remaining_seconds"`
 }
 
 // ── AdaptiveCache ──────────────────────────────────────────────────────────────
 
-// AdaptiveCache adalah in-memory cache dengan TTL dinamis berbasis durasi
-// dan evaluasi frekuensi per siklus bulanan.
+// AdaptiveCache adalah in-memory cache dengan tiga pilar adaptasi.
 type AdaptiveCache struct {
 	mu    sync.RWMutex
 	items map[string]*CacheEntry
 
-	// Parameter adaptasi global
+	// Parameter adaptasi
 	TTLBaseline time.Duration
 	TTLMax      time.Duration
 	AdaptCoeff  float64
-	SkipLowFreq bool
 
-	// TTL per-key hasil evaluasi bulanan (override TTLBaseline)
-	keyTTL  map[string]time.Duration // TTL yang ditetapkan per key
-	skipKey map[string]bool          // key yang diskip dari cache
+	// Tracking bulan berjalan
+	currentMonth int
+	currentYear  int
 
-	// Statistik per-key dalam siklus berjalan
-	keyStats map[string]*KeyStat
+	// Hot key profiles untuk bulan ini (hasil eval bulan lalu)
+	hotKeyProfiles map[string]*HotKeyProfile
 
-	// Metadata siklus
-	CycleStart time.Time
-	LastEval   time.Time
-	NextEval   time.Time
+	// Riwayat evaluasi bulanan
+	evalHistory []MonthlyEvalSnapshot
+
+	// Warmup callback (diisi dari luar oleh handler)
+	warmupFunc WarmupFunc
 
 	// Statistik global
 	TotalHits    int64
@@ -175,169 +193,135 @@ type AdaptiveCache struct {
 
 // ── Konstruktor ────────────────────────────────────────────────────────────────
 
-// NewAdaptiveCache membuat instance cache adaptif dengan konfigurasi default.
+// NewAdaptiveCache membuat instance cache baru.
 func NewAdaptiveCache() *AdaptiveCache {
 	now := time.Now()
 	c := &AdaptiveCache{
-		items:       make(map[string]*CacheEntry),
-		keyTTL:      make(map[string]time.Duration),
-		skipKey:     make(map[string]bool),
-		keyStats:    make(map[string]*KeyStat),
-		TTLBaseline: DefaultTTLBaseline,
-		TTLMax:      DefaultTTLMax,
-		AdaptCoeff:  DefaultAdaptCoeff,
-		SkipLowFreq: SkipLowFreqDefault,
-		CycleStart:  now,
-		LastEval:    now,
-		NextEval:    now.Add(EvalCycleInterval),
+		items:          make(map[string]*CacheEntry),
+		hotKeyProfiles: make(map[string]*HotKeyProfile),
+		evalHistory:    []MonthlyEvalSnapshot{},
+		TTLBaseline:    DefaultTTLBaseline,
+		TTLMax:         DefaultTTLMax,
+		AdaptCoeff:     DefaultAdaptCoeff,
+		currentMonth:   int(now.Month()),
+		currentYear:    now.Year(),
 	}
-	log.Printf("[AdaptiveCache] Init → TTL_baseline=%v TTL_max=%v AdaptCoeff=%.4f window=%s–%s",
-		c.TTLBaseline, c.TTLMax, c.AdaptCoeff, ActiveWindowStart, ActiveWindowEnd)
+	log.Printf("[Cache] ══ Auto-Cache Adaptif Aktif ══")
+	log.Printf("[Cache] TTL_baseline  = %v", c.TTLBaseline)
+	log.Printf("[Cache] TTL_max       = %v", c.TTLMax)
+	log.Printf("[Cache] AdaptCoeff    = %.4f", c.AdaptCoeff)
+	log.Printf("[Cache] Bulan aktif   = %s", monthLabel(now.Year(), int(now.Month())))
+	log.Printf("[Cache] Tiga pilar: (1) Jam akses awal  (2) Cache hit  (3) Durasi aktif")
 	return c
 }
 
-// ── Jendela Waktu Aktif ────────────────────────────────────────────────────────
-
-// IsWindowActive mengecek apakah waktu sekarang berada dalam jendela aktif
-// cache (06:30 – 24:00).
-//
-//	06:30 = menit ke-390
-//	24:00 = menit ke-1440 (setara batas akhir hari, 23:59 termasuk aktif)
-func IsWindowActive() bool {
-	now := time.Now()
-	h, m, _ := now.Clock()
-	totalMinutes := h*60 + m
-
-	startMinutes := 6*60 + 30 // 390
-	endMinutes := 24 * 60     // 1440
-
-	return totalMinutes >= startMinutes && totalMinutes < endMinutes
-}
-
-// windowStatusString mengembalikan deskripsi status jendela aktif.
-func windowStatusString() string {
-	if IsWindowActive() {
-		return fmt.Sprintf("AKTIF (window %s–%s)", ActiveWindowStart, ActiveWindowEnd)
-	}
-	h, m, _ := time.Now().Clock()
-	return fmt.Sprintf("NONAKTIF — sekarang %02d:%02d, di luar window %s–%s",
-		h, m, ActiveWindowStart, ActiveWindowEnd)
+// RegisterWarmupFunc mendaftarkan fungsi yang akan dipanggil saat pre-warm.
+// Harus dipanggil dari main.go setelah handler siap.
+func (c *AdaptiveCache) RegisterWarmupFunc(fn WarmupFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.warmupFunc = fn
+	log.Println("[Cache] WarmupFunc terdaftar — pre-warming otomatis aktif.")
 }
 
 // ── Perhitungan TTL Per-Key ────────────────────────────────────────────────────
 
-// baselineTTLForKey mengembalikan TTL dasar yang berlaku untuk key tertentu.
-// Menggunakan override hasil evaluasi bulanan jika ada, atau TTLBaseline global.
-func (c *AdaptiveCache) baselineTTLForKey(key string) time.Duration {
-	if ttl, ok := c.keyTTL[key]; ok {
-		return ttl
-	}
-	return c.TTLBaseline
-}
-
-// computeRuntimeTTL menghitung TTL_runtime:
+// computeKeyTTL menghitung TTL untuk key berdasarkan durasi aktifnya bulan ini.
 //
-//	TTL_runtime = TTL_key + f(D)
-//	f(D)        = AdaptCoeff × D.Seconds()
+//   D_key       = LastAccessEver − FirstAccessEver  (durasi aktif key bulan ini)
+//   TTL_runtime = TTL_baseline + AdaptCoeff × D_key.Seconds()  ≤ TTL_max
 //
-// Dibatasi oleh TTL_max.
-func (c *AdaptiveCache) computeRuntimeTTL(key string, entry *CacheEntry) time.Duration {
-	D := time.Since(entry.T0)
-	keyBaseline := c.baselineTTLForKey(key)
+// Jika key punya profil dari bulan lalu (hot key), gunakan SuggestedTTL sebagai baseline.
+func (c *AdaptiveCache) computeKeyTTL(key string, stats *keyMonthlyStats) time.Duration {
+	baseline := c.TTLBaseline
 
-	adaptedSec := keyBaseline.Seconds() + c.AdaptCoeff*D.Seconds()
-	runtimeTTL := time.Duration(adaptedSec * float64(time.Second))
-
-	if runtimeTTL > c.TTLMax {
-		runtimeTTL = c.TTLMax
-	}
-	return runtimeTTL
-}
-
-// ── Pencatatan Statistik Per-Key ──────────────────────────────────────────────
-
-func (c *AdaptiveCache) recordHit(key string, entry *CacheEntry) {
-	stat := c.ensureKeyStat(key)
-	stat.HitCount++
-	stat.TotalDuration += time.Since(entry.T0)
-	stat.LastAccess = time.Now()
-}
-
-func (c *AdaptiveCache) recordMiss(key string) {
-	stat := c.ensureKeyStat(key)
-	stat.MissCount++
-	stat.LastAccess = time.Now()
-}
-
-func (c *AdaptiveCache) ensureKeyStat(key string) *KeyStat {
-	if _, ok := c.keyStats[key]; !ok {
-		c.keyStats[key] = &KeyStat{
-			Key:         key,
-			AssignedTTL: c.TTLBaseline,
-			Class:       FreqMedium,
+	// Jika key ini adalah hot key dari bulan lalu, gunakan SuggestedTTL-nya
+	if profile, isHot := c.hotKeyProfiles[key]; isHot {
+		if profile.SuggestedTTL > baseline {
+			baseline = profile.SuggestedTTL
+			log.Printf("[Cache TTL] key=%q menggunakan SuggestedTTL dari profil bulan lalu: %v",
+				key, baseline.Round(time.Second))
 		}
 	}
-	return c.keyStats[key]
+
+	// Pilar 3: hitung durasi aktif key bulan ini
+	var D_key time.Duration
+	if !stats.FirstAccessEver.IsZero() && !stats.LastAccessEver.IsZero() {
+		D_key = stats.LastAccessEver.Sub(stats.FirstAccessEver)
+	}
+
+	adaptedSec := baseline.Seconds() + c.AdaptCoeff*D_key.Seconds()
+	runtime := time.Duration(adaptedSec * float64(time.Second))
+
+	if runtime > c.TTLMax {
+		runtime = c.TTLMax
+	}
+	return runtime
 }
 
-// ── Operasi Cache Utama ────────────────────────────────────────────────────────
+// ── Operasi Cache ──────────────────────────────────────────────────────────────
 
 // Get mengambil item dari cache.
 //
-//   - Di luar jendela aktif (< 06:30) → lewati cache, langsung ke DB
-//   - Key masuk skip list (LOW freq)  → lewati cache
-//   - Entry kadaluarsa               → hapus, return miss
-//   - HIT                            → perbarui TTL adaptif, catat statistik
+// Saat HIT — tiga pilar dicatat:
+//   Pilar 1: catat jam akses pertama hari ini
+//   Pilar 2: tambah HitCount
+//   Pilar 3: perbarui LastAccessTime → perpanjang durasi aktif
 func (c *AdaptiveCache) Get(key string) (interface{}, bool) {
-	// ── Cek jendela waktu ──
-	if !IsWindowActive() {
-		log.Printf("[Cache WINDOW-SKIP] key=%q — %s", key, windowStatusString())
-		c.mu.Lock()
-		c.TotalMisses++
-		c.recordMiss(key)
-		c.mu.Unlock()
-		return nil, false
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// ── Cek skip list (hasil evaluasi LOW freq) ──
-	if c.skipKey[key] {
-		log.Printf("[Cache FREQ-SKIP] key=%q — klasifikasi LOW, langsung ke DB", key)
-		c.TotalMisses++
-		c.recordMiss(key)
-		return nil, false
-	}
 
 	entry, exists := c.items[key]
 	if !exists {
 		c.TotalMisses++
-		c.recordMiss(key)
 		return nil, false
 	}
 
-	// ── Cek kadaluarsa ──
-	if time.Now().After(entry.ExpireAt) {
+	now := time.Now()
+
+	// Cek kadaluarsa
+	if now.After(entry.ExpireAt) {
 		delete(c.items, key)
 		c.CleanupCount++
 		c.TotalMisses++
-		c.recordMiss(key)
 		return nil, false
 	}
 
 	// ── Cache HIT ──
 	c.TotalHits++
-	entry.HitCount++
-	c.recordHit(key, entry)
+	stats := entry.stats
 
-	newTTL := c.computeRuntimeTTL(key, entry)
-	entry.ExpireAt = time.Now().Add(newTTL)
+	// PILAR 2: Tambah HitCount
+	stats.TotalHits++
 
-	class := c.keyStats[key].Class
-	log.Printf("[Cache HIT] key=%q class=%s D=%.1fs TTL_runtime=%v expire=%v",
-		key, class,
-		time.Since(entry.T0).Seconds(),
+	// PILAR 1: Catat jam akses pertama hari ini
+	today := now.Format("2006-01-02")
+	if _, exists := stats.DailyRecords[today]; !exists {
+		stats.DailyRecords[today] = &dailyRecord{
+			Date:      today,
+			FirstTime: now, // ← JAM PERTAMA akses hari ini (Pilar 1)
+			LastTime:  now,
+			Hits:      1,
+		}
+		log.Printf("[Cache HIT][Pilar 1] key=%-25q | jam akses pertama hari ini: %s",
+			key, now.Format("15:04:05"))
+	} else {
+		stats.DailyRecords[today].LastTime = now
+		stats.DailyRecords[today].Hits++
+	}
+
+	// PILAR 3: Perbarui LastAccessEver → perpanjang durasi aktif
+	stats.LastAccessEver = now
+
+	// Hitung ulang TTL berdasarkan durasi aktif key ini
+	newTTL := c.computeKeyTTL(key, stats)
+	entry.ExpireAt = now.Add(newTTL)
+
+	D_key := stats.LastAccessEver.Sub(stats.FirstAccessEver)
+	log.Printf("[Cache HIT]  key=%-25q | hits=%d | D_key=%6.1fs | TTL_runtime=%-10v | expire=%s",
+		key,
+		stats.TotalHits,
+		D_key.Seconds(),
 		newTTL.Round(time.Second),
 		entry.ExpireAt.Format("15:04:05"),
 	)
@@ -345,86 +329,92 @@ func (c *AdaptiveCache) Get(key string) (interface{}, bool) {
 	return entry.Value, true
 }
 
-// Set menyimpan item ke cache.
-//
-//   - Di luar jendela aktif → tidak disimpan
-//   - Key dalam skip list   → tidak disimpan
-//   - Key sudah ada         → perbarui value + hitung ulang TTL
-//   - Key baru              → buat entry baru dengan TTL_key
+// Set menyimpan item ke cache dan menginisialisasi stats tracking.
 func (c *AdaptiveCache) Set(key string, value interface{}) {
-	// ── Cek jendela waktu ──
-	if !IsWindowActive() {
-		log.Printf("[Cache SET-WINDOW-SKIP] key=%q — %s, tidak disimpan", key, windowStatusString())
-		return
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// ── Cek skip list ──
-	if c.skipKey[key] {
-		log.Printf("[Cache SET-FREQ-SKIP] key=%q — LOW freq, tidak disimpan", key)
-		return
-	}
-
 	now := time.Now()
+	today := now.Format("2006-01-02")
 
-	// Update entry yang sudah ada
+	// Entry sudah ada → update value saja, pertahankan stats
 	if existing, ok := c.items[key]; ok {
 		existing.Value = value
-		newTTL := c.computeRuntimeTTL(key, existing)
+		newTTL := c.computeKeyTTL(key, existing.stats)
 		existing.ExpireAt = now.Add(newTTL)
-		log.Printf("[Cache SET-UPDATE] key=%q TTL_runtime=%v", key, newTTL.Round(time.Second))
+		log.Printf("[Cache SET-UPDATE] key=%-25q | TTL=%v", key, newTTL.Round(time.Second))
 		return
 	}
 
-	// Entry baru
-	keyBaseline := c.baselineTTLForKey(key)
-	entry := &CacheEntry{
-		Value:    value,
-		T0:       now,
-		ExpireAt: now.Add(keyBaseline),
+	// Entry baru → buat stats baru, gunakan TTL dari profil hot key jika ada
+	stats := &keyMonthlyStats{
+		Key:             key,
+		Month:           c.currentMonth,
+		Year:            c.currentYear,
+		FirstAccessEver: now,
+		LastAccessEver:  now,
+		TotalHits:       0,
+		DailyRecords: map[string]*dailyRecord{
+			today: {
+				Date:      today,
+				FirstTime: now,
+				LastTime:  now,
+				Hits:      0,
+			},
+		},
 	}
-	c.items[key] = entry
-	c.ensureKeyStat(key)
 
-	log.Printf("[Cache SET-NEW] key=%q TTL_key=%v expire=%v",
-		key, keyBaseline.Round(time.Second), entry.ExpireAt.Format("15:04:05"))
+	// Tentukan TTL awal
+	ttl := c.TTLBaseline
+	if profile, isHot := c.hotKeyProfiles[key]; isHot {
+		if profile.SuggestedTTL > ttl {
+			ttl = profile.SuggestedTTL
+		}
+	}
+
+	c.items[key] = &CacheEntry{
+		Value:    value,
+		ExpireAt: now.Add(ttl),
+		stats:    stats,
+	}
+
+	log.Printf("[Cache SET-NEW]    key=%-25q | TTL_init=%v | expire=%s",
+		key, ttl.Round(time.Second), now.Add(ttl).Format("15:04:05"))
 }
 
-// Delete menghapus satu item dari cache (digunakan saat invalidasi CRUD).
+// Delete menghapus satu item (invalidasi CRUD).
 func (c *AdaptiveCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.items[key]; ok {
 		delete(c.items, key)
-		log.Printf("[Cache INVALIDATE] key=%q dihapus", key)
+		log.Printf("[Cache INVALIDATE] key=%q dihapus (CRUD)", key)
 	}
 }
 
-// DeleteByPrefix menghapus semua item dengan awalan prefix tertentu.
+// DeleteByPrefix menghapus semua item dengan prefix tertentu.
 func (c *AdaptiveCache) DeleteByPrefix(prefix string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	count := 0
+	n := 0
 	for k := range c.items {
 		if strings.HasPrefix(k, prefix) {
 			delete(c.items, k)
-			count++
+			n++
 		}
 	}
-	if count > 0 {
-		log.Printf("[Cache INVALIDATE-PREFIX] prefix=%q → %d item dihapus", prefix, count)
+	if n > 0 {
+		log.Printf("[Cache INVALIDATE-PREFIX] prefix=%q → %d item dihapus", prefix, n)
 	}
 }
 
 // ── Goroutine Background ───────────────────────────────────────────────────────
 
-// AutoCleanup menjalankan pembersihan entry kadaluarsa setiap CleanupInterval.
+// AutoCleanup menjalankan pembersihan entry kadaluarsa setiap menit.
 func (c *AdaptiveCache) AutoCleanup() {
 	ticker := time.NewTicker(CleanupInterval)
 	defer ticker.Stop()
-	log.Println("[Cache] AutoCleanup goroutine dimulai, interval:", CleanupInterval)
+	log.Println("[Cache] AutoCleanup goroutine aktif.")
 	for range ticker.C {
 		c.runCleanup()
 	}
@@ -434,226 +424,315 @@ func (c *AdaptiveCache) runCleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	removed := 0
+	n := 0
 	for k, entry := range c.items {
 		if now.After(entry.ExpireAt) {
 			delete(c.items, k)
 			c.CleanupCount++
-			removed++
+			n++
 		}
 	}
-	if removed > 0 {
-		log.Printf("[Cache Cleanup] %d entry dihapus (total siklus: %d)", removed, c.CleanupCount)
+	if n > 0 {
+		log.Printf("[Cache Cleanup] %d entry kadaluarsa dihapus.", n)
 	}
 }
 
-// EvaluationCycle menjalankan evaluasi bulanan setiap EvalCycleInterval.
-func (c *AdaptiveCache) EvaluationCycle() {
-	ticker := time.NewTicker(EvalCycleInterval)
+// MonthlyEvaluationCycle memeriksa pergantian bulan setiap jam.
+func (c *AdaptiveCache) MonthlyEvaluationCycle() {
+	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
-	log.Println("[Cache] EvaluationCycle goroutine dimulai, interval:", EvalCycleInterval)
+	log.Println("[Cache] MonthlyEvaluationCycle goroutine aktif (cek tiap 1 jam).")
 	for range ticker.C {
-		c.runEvaluation()
+		now := time.Now()
+		c.mu.RLock()
+		changed := int(now.Month()) != c.currentMonth || now.Year() != c.currentYear
+		c.mu.RUnlock()
+		if changed {
+			c.runMonthlyEvaluation(now)
+		}
 	}
 }
 
-// ── Evaluasi Siklus Bulanan ────────────────────────────────────────────────────
-
-// runEvaluation menjalankan satu siklus evaluasi penuh:
+// runMonthlyEvaluation menjalankan evaluasi tiga pilar saat bulan berganti.
 //
-//  1. Re-kalibrasi TTL_baseline global berdasarkan D_total dan D_avg
-//  2. Klasifikasi setiap key: HIGH / MEDIUM / LOW
-//  3. Tetapkan TTL_key baru berdasarkan kelas
-//  4. Tandai key LOW ke skipKey jika SkipLowFreq aktif
-//  5. Bersihkan entry kadaluarsa
-//  6. Reset semua counter siklus
-func (c *AdaptiveCache) runEvaluation() {
+//  Untuk setiap key yang pernah di-hit bulan ini:
+//    Pilar 1: hitung AvgFirstHour & AvgFirstMinute dari DailyRecords
+//    Pilar 2: simpan HitCount (hanya key dengan hit > 0 yang jadi hot key)
+//    Pilar 3: SuggestedTTL = LastAccessEver − FirstAccessEver (durasi aktif)
+func (c *AdaptiveCache) runMonthlyEvaluation(now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	now := time.Now()
+	prevMonth := c.currentMonth
+	prevYear := c.currentYear
 
-	// ── 1. Re-kalibrasi TTL_baseline global ──────────────────────────────
-	D_total := now.Sub(c.CycleStart)
-	D_avg := D_total / 30
-	g_Davg := time.Duration(c.AdaptCoeff * float64(D_avg))
-	newBaseline := c.TTLBaseline + g_Davg
-	if newBaseline > c.TTLMax {
-		newBaseline = c.TTLMax
-	}
-	log.Printf("[Evaluation] D_total=%.2fh D_avg=%.2fh TTL_baseline: %v → %v",
-		D_total.Hours(), D_avg.Hours(), c.TTLBaseline, newBaseline)
-	c.TTLBaseline = newBaseline
-
-	// ── 2–4. Klasifikasi dan penetapan TTL per-key ────────────────────────
-	highKeys, lowKeys, skipKeys := []string{}, []string{}, []string{}
-
-	for key, stat := range c.keyStats {
-		var class FreqClass
-		var assignedTTL time.Duration
-		var skip bool
-
-		switch {
-		case stat.HitCount >= HighFreqThreshold:
-			// TINGGI: prioritas pre-cache, TTL diperpanjang
-			class = FreqHigh
-			assignedTTL = time.Duration(float64(c.TTLBaseline) * HighFreqMultiplier)
-			if assignedTTL > c.TTLMax {
-				assignedTTL = c.TTLMax
-			}
-			highKeys = append(highKeys, key)
-
-		case stat.HitCount >= LowFreqThreshold:
-			// SEDANG: TTL tidak berubah dari baseline
-			class = FreqMedium
-			assignedTTL = c.TTLBaseline
-
-		default:
-			// RENDAH: TTL dipersingkat, opsional skip
-			class = FreqLow
-			assignedTTL = time.Duration(float64(c.TTLBaseline) * LowFreqMultiplier)
-			lowKeys = append(lowKeys, key)
-			if c.SkipLowFreq {
-				skip = true
-				skipKeys = append(skipKeys, key)
-			}
-		}
-
-		stat.Class = class
-		stat.AssignedTTL = assignedTTL
-		stat.SkipCache = skip
-		c.keyTTL[key] = assignedTTL
-		c.skipKey[key] = skip
-
-		log.Printf("[Evaluation] key=%-32q hits=%-5d class=%-6s TTL=%v skip=%v",
-			key, stat.HitCount, class, assignedTTL.Round(time.Second), skip)
-	}
-
-	// ── 5. Pre-cache hint (log untuk monitoring) ──────────────────────────
-	if len(highKeys) > 0 {
-		log.Printf("[Evaluation] PRE-CACHE priority (%d key): %v", len(highKeys), highKeys)
-	}
-	if len(skipKeys) > 0 {
-		log.Printf("[Evaluation] SKIP-CACHE (%d key): %v", len(skipKeys), skipKeys)
-	}
-
-	// ── 6. Bersihkan entry kadaluarsa ─────────────────────────────────────
-	for k, entry := range c.items {
-		if now.After(entry.ExpireAt) {
-			delete(c.items, k)
-		}
-	}
-
-	// ── 7. Reset metadata siklus ──────────────────────────────────────────
-	c.LastEval = now
-	c.NextEval = now.Add(EvalCycleInterval)
-	c.CycleStart = now
-	c.CleanupCount = 0
-
-	// Reset counter hit/miss per-key (kelas dan TTL dipertahankan)
-	for _, stat := range c.keyStats {
-		stat.HitCount = 0
-		stat.MissCount = 0
-		stat.TotalDuration = 0
-	}
-
-	log.Printf("[Evaluation] Siklus baru dimulai. HIGH=%d MEDIUM=%d LOW=%d SKIP=%d",
-		len(highKeys),
-		len(c.keyStats)-len(highKeys)-len(lowKeys),
-		len(lowKeys),
-		len(skipKeys),
+	log.Printf("[Cache Eval] ══ EVALUASI BULANAN: %s → %s ══",
+		monthLabel(prevYear, prevMonth),
+		monthLabel(now.Year(), int(now.Month())),
 	)
+
+	// Kumpulkan semua stats dari entry aktif
+	allStats := []*keyMonthlyStats{}
+	for _, entry := range c.items {
+		if entry.stats != nil && entry.stats.Month == prevMonth && entry.stats.Year == prevYear {
+			allStats = append(allStats, entry.stats)
+		}
+	}
+
+	// Bangun hot key profiles baru
+	newProfiles := make(map[string]*HotKeyProfile)
+	snapshots := []HotKeyProfile{}
+
+	for _, stats := range allStats {
+		// PILAR 2: Hanya key yang pernah di-hit
+		if stats.TotalHits == 0 {
+			log.Printf("[Cache Eval] key=%q dilewati (tidak ada hit bulan ini)", stats.Key)
+			continue
+		}
+
+		// PILAR 1: Hitung rata-rata jam & menit akses pertama harian
+		avgHour, avgMinute := computeAvgFirstAccess(stats.DailyRecords)
+
+		// PILAR 3: SuggestedTTL = durasi aktif (LastAccess − FirstAccess)
+		activeDuration := stats.LastAccessEver.Sub(stats.FirstAccessEver)
+		if activeDuration < c.TTLBaseline {
+			activeDuration = c.TTLBaseline // minimal TTL_baseline
+		}
+		if activeDuration > c.TTLMax {
+			activeDuration = c.TTLMax
+		}
+
+		profile := &HotKeyProfile{
+			Key:               stats.Key,
+			HitCountLastMonth: stats.TotalHits,
+			AvgFirstHour:      avgHour,
+			AvgFirstMinute:    avgMinute,
+			SuggestedTTL:      activeDuration,
+			ActiveDurationSec: activeDuration.Seconds(),
+			EvalMonth:         monthLabel(prevYear, prevMonth),
+		}
+		newProfiles[stats.Key] = profile
+		snapshots = append(snapshots, *profile)
+
+		log.Printf("[Cache Eval] HOT KEY: key=%-25q | hits=%d | pre-warm=%02d:%02d | TTL=%v",
+			stats.Key,
+			stats.TotalHits,
+			avgHour, avgMinute,
+			activeDuration.Round(time.Second),
+		)
+	}
+
+	// Simpan snapshot ke riwayat
+	c.evalHistory = append(c.evalHistory, MonthlyEvalSnapshot{
+		Month:        monthLabel(prevYear, prevMonth),
+		HotKeysFound: len(newProfiles),
+		Profiles:     snapshots,
+		EvaluatedAt:  now,
+	})
+	if len(c.evalHistory) > 12 {
+		c.evalHistory = c.evalHistory[len(c.evalHistory)-12:]
+	}
+
+	// Terapkan hot key profiles baru untuk bulan ini
+	c.hotKeyProfiles = newProfiles
+
+	// Reset bulan aktif
+	c.currentMonth = int(now.Month())
+	c.currentYear = now.Year()
+
+	log.Printf("[Cache Eval] %d hot key terdaftar untuk bulan %s.",
+		len(newProfiles), monthLabel(c.currentYear, c.currentMonth))
+	log.Printf("[Cache Eval] Pre-warming terjadwal sesuai AvgFirstAccess masing-masing key.")
+}
+
+// WarmupScheduler memeriksa setiap menit apakah ada hot key yang perlu di-warm.
+//
+// Pilar 1 beraksi di sini:
+//   Jika jam sekarang cocok dengan AvgFirstHour:AvgFirstMinute suatu hot key
+//   dan belum di-warm hari ini → panggil WarmupFunc → simpan ke cache
+//   → Pengguna datang, cache sudah siap!
+func (c *AdaptiveCache) WarmupScheduler() {
+	ticker := time.NewTicker(WarmupCheckInterval)
+	defer ticker.Stop()
+	log.Println("[Cache] WarmupScheduler goroutine aktif (cek tiap 1 menit).")
+	for range ticker.C {
+		c.checkAndWarm()
+	}
+}
+
+func (c *AdaptiveCache) checkAndWarm() {
+	c.mu.Lock()
+	fn := c.warmupFunc
+	c.mu.Unlock()
+
+	if fn == nil {
+		return // warmup function belum didaftarkan
+	}
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, profile := range c.hotKeyProfiles {
+		// Sudah di-warm hari ini? Lewati.
+		if profile.lastWarmDate == today {
+			continue
+		}
+
+		// Cek apakah jam sekarang cocok dengan jadwal pre-warm
+		if now.Hour() == profile.AvgFirstHour && now.Minute() == profile.AvgFirstMinute {
+			key := profile.Key
+			log.Printf("[Cache PREWARM] ⏰ Jadwal terpicu! key=%q | jadwal=%02d:%02d | TTL=%v",
+				key, profile.AvgFirstHour, profile.AvgFirstMinute,
+				profile.SuggestedTTL.Round(time.Second))
+
+			// Panggil WarmupFunc di goroutine terpisah (tidak block scheduler)
+			go func(k string, ttl time.Duration, pf *HotKeyProfile) {
+				data, err := fn(k)
+				if err != nil {
+					log.Printf("[Cache PREWARM] GAGAL pre-warm key=%q: %v", k, err)
+					return
+				}
+				c.mu.Lock()
+				defer c.mu.Unlock()
+
+				now2 := time.Now()
+				stats := &keyMonthlyStats{
+					Key:             k,
+					Month:           c.currentMonth,
+					Year:            c.currentYear,
+					FirstAccessEver: now2,
+					LastAccessEver:  now2,
+					TotalHits:       0,
+					DailyRecords: map[string]*dailyRecord{
+						now2.Format("2006-01-02"): {
+							Date:      now2.Format("2006-01-02"),
+							FirstTime: now2,
+							LastTime:  now2,
+							Hits:      0,
+						},
+					},
+				}
+				c.items[k] = &CacheEntry{
+					Value:    data,
+					ExpireAt: now2.Add(ttl),
+					stats:    stats,
+				}
+				pf.lastWarmDate = today
+				log.Printf("[Cache PREWARM] ✅ key=%q berhasil di-pre-warm. TTL=%v | expire=%s",
+					k, ttl.Round(time.Second), now2.Add(ttl).Format("15:04:05"))
+			}(key, profile.SuggestedTTL, profile)
+		}
+	}
+}
+
+// TriggerEvaluationNow memaksa evaluasi bulanan sekarang (untuk testing).
+func (c *AdaptiveCache) TriggerEvaluationNow() {
+	log.Println("[Cache] TriggerEvaluationNow: evaluasi dipicu manual.")
+	c.runMonthlyEvaluation(time.Now())
+}
+
+// TriggerWarmupNow memaksa pre-warm semua hot key sekarang (untuk testing).
+func (c *AdaptiveCache) TriggerWarmupNow() {
+	c.mu.Lock()
+	// Reset flag last_warm_date agar semua hot key bisa di-warm ulang
+	for _, p := range c.hotKeyProfiles {
+		p.lastWarmDate = ""
+	}
+	fn := c.warmupFunc
+	c.mu.Unlock()
+
+	if fn == nil {
+		log.Println("[Cache] TriggerWarmupNow: WarmupFunc belum didaftarkan.")
+		return
+	}
+	log.Println("[Cache] TriggerWarmupNow: memicu pre-warm semua hot key.")
+	c.checkAndWarm()
 }
 
 // ── Statistik ──────────────────────────────────────────────────────────────────
 
-// GetStats mengembalikan statistik lengkap cache adaptif.
+// GetStats mengembalikan statistik lengkap sistem cache adaptif.
 func (c *AdaptiveCache) GetStats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	now := time.Now()
-
 	total := c.TotalHits + c.TotalMisses
 	hitRatio := 0.0
 	if total > 0 {
 		hitRatio = float64(c.TotalHits) / float64(total) * 100.0
 	}
 
-	var sumDur, sumTTL float64
+	// Statistik per key aktif
+	activeStats := []ActiveKeyStat{}
 	activeCount := 0
-	for _, entry := range c.items {
+	for key, entry := range c.items {
 		if now.Before(entry.ExpireAt) {
-			sumDur += time.Since(entry.T0).Seconds()
-			sumTTL += time.Until(entry.ExpireAt).Seconds()
 			activeCount++
+			s := entry.stats
+			dur := 0.0
+			avgH, avgM := 0, 0
+			if s != nil {
+				dur = s.LastAccessEver.Sub(s.FirstAccessEver).Seconds()
+				avgH, avgM = computeAvgFirstAccess(s.DailyRecords)
+				activeStats = append(activeStats, ActiveKeyStat{
+					Key:               key,
+					HitCount:          s.TotalHits,
+					ActiveDurationSec: dur,
+					AvgFirstHour:      avgH,
+					AvgFirstMinute:    avgM,
+					TTLRemainingSec:   time.Until(entry.ExpireAt).Seconds(),
+				})
+			}
 		}
-	}
-	avgDur, avgTTL := 0.0, 0.0
-	if activeCount > 0 {
-		avgDur = sumDur / float64(activeCount)
-		avgTTL = sumTTL / float64(activeCount)
 	}
 
-	keyStatSlice := make([]KeyStat, 0, len(c.keyStats))
-	highKeys, lowKeys, skippedKeys := []string{}, []string{}, []string{}
-	for _, stat := range c.keyStats {
-		keyStatSlice = append(keyStatSlice, *stat)
-		switch stat.Class {
-		case FreqHigh:
-			highKeys = append(highKeys, stat.Key)
-		case FreqLow:
-			lowKeys = append(lowKeys, stat.Key)
-		}
-		if stat.SkipCache {
-			skippedKeys = append(skippedKeys, stat.Key)
-		}
+	// Hot key profiles (untuk bulan depan)
+	profiles := []HotKeyProfile{}
+	for _, p := range c.hotKeyProfiles {
+		profiles = append(profiles, *p)
 	}
 
 	return CacheStats{
-		ItemCount:       activeCount,
-		TotalHits:       c.TotalHits,
-		TotalMisses:     c.TotalMisses,
-		HitRatioPct:     hitRatio,
-		AvgDurationSec:  avgDur,
-		AvgActiveTTLSec: avgTTL,
-
+		ItemCount:      activeCount,
+		TotalHits:      c.TotalHits,
+		TotalMisses:    c.TotalMisses,
+		HitRatioPct:    hitRatio,
+		CurrentMonth:   monthLabel(c.currentYear, c.currentMonth),
 		TTLBaselineSec: c.TTLBaseline.Seconds(),
 		TTLMaxSec:      c.TTLMax.Seconds(),
 		AdaptCoeff:     c.AdaptCoeff,
-
-		ActiveWindowStart: ActiveWindowStart,
-		ActiveWindowEnd:   ActiveWindowEnd,
-		IsWindowActive:    IsWindowActive(),
-		WindowStatus:      windowStatusString(),
-
-		CleanupCount: c.CleanupCount,
-		CycleStart:   c.CycleStart,
-		LastEvalTime: c.LastEval,
-		NextEvalTime: c.NextEval,
-
-		KeyStats:     keyStatSlice,
-		HighFreqKeys: highKeys,
-		LowFreqKeys:  lowKeys,
-		SkippedKeys:  skippedKeys,
+		CleanupCount:   c.CleanupCount,
+		HotKeyProfiles: profiles,
+		MonthlyHistory: c.evalHistory,
+		ActiveKeyStats: activeStats,
 	}
 }
 
-// ── Konfigurasi Runtime ────────────────────────────────────────────────────────
+// ── Helper ─────────────────────────────────────────────────────────────────────
 
-// SetSkipLowFreq mengubah perilaku key LOW freq secara runtime.
-// true  = key LOW langsung ke DB (skip cache)
-// false = key LOW tetap di-cache dengan TTL lebih pendek
-func (c *AdaptiveCache) SetSkipLowFreq(skip bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.SkipLowFreq = skip
-	log.Printf("[Cache Config] SkipLowFreq → %v", skip)
+// computeAvgFirstAccess menghitung rata-rata jam & menit akses pertama harian.
+func computeAvgFirstAccess(daily map[string]*dailyRecord) (hour, minute int) {
+	if len(daily) == 0 {
+		return 0, 0
+	}
+	var totalMinutes int
+	n := 0
+	for _, rec := range daily {
+		totalMinutes += rec.FirstTime.Hour()*60 + rec.FirstTime.Minute()
+		n++
+	}
+	avgMin := totalMinutes / n
+	return avgMin / 60, avgMin % 60
 }
 
-// ForceEvaluate memaksa evaluasi siklus langsung tanpa menunggu 30 hari.
-// Berguna untuk keperluan testing.
-func (c *AdaptiveCache) ForceEvaluate() {
-	log.Println("[Cache] ForceEvaluate dipanggil manual.")
-	c.runEvaluation()
+func monthKey(year, month int) string {
+	return fmt.Sprintf("%04d-%02d", year, month)
+}
+
+func monthLabel(year, month int) string {
+	return time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).Format("January 2006")
 }

@@ -1,12 +1,17 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  RESTFUL API — AUTO-CACHE ADAPTIF (EVALUASI PERGANTIAN BULAN)           ║
+// ║  RESTFUL API — AUTO-CACHE ADAPTIF (TIGA PILAR)                          ║
 // ║  Golang + Gin Framework + SQLite                                         ║
+// ╠══════════════════════════════════════════════════════════════════════════╣
+// ║  PILAR 1 — Akses Awal                                                    ║
+// ║    Catat jam pertama setiap key diakses tiap hari.                       ║
+// ║    Bulan depan: pre-warm otomatis pada jam yang sama.                    ║
 // ║                                                                          ║
-// ║  Algoritma:                                                              ║
-// ║    TTL_runtime = TTL_baseline + AdaptCoeff × (TLast − T0)               ║
-// ║    Saat bulan berganti:                                                  ║
-// ║      D_avg = rata-rata (TLast−T0) semua entry bulan lalu                ║
-// ║      TTL_baseline_baru = TTL_baseline_lama + AdaptCoeff × D_avg         ║
+// ║  PILAR 2 — Cache Hit                                                     ║
+// ║    Hanya key yang pernah di-hit yang menjadi hot key bulan depan.        ║
+// ║                                                                          ║
+// ║  PILAR 3 — Durasi Cache                                                  ║
+// ║    Durasi aktif bulan ini (LastAccess − FirstAccess) menjadi             ║
+// ║    SuggestedTTL key tersebut di bulan berikutnya.                        ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 package main
 
@@ -25,28 +30,33 @@ import (
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.SetPrefix("[API] ")
-	log.Println("=== RESTful API dengan Auto-Cache Adaptif (Evaluasi per Bulan) ===")
+	log.Println("=== RESTful API Auto-Cache Adaptif (Tiga Pilar) ===")
 
-	// ── Database ─────────────────────────────────────────────────────────
+	// ── Database ──────────────────────────────────────────────────────────
 	dbPath := getEnv("DB_PATH", "./products.db")
 	database, err := db.InitDB(dbPath)
 	if err != nil {
-		log.Fatalf("FATAL: Gagal inisialisasi database: %v", err)
+		log.Fatalf("FATAL: %v", err)
 	}
 	defer database.Close()
 
-	// ── Cache Adaptif ─────────────────────────────────────────────────────
+	// ── Cache Adaptif ──────────────────────────────────────────────────────
 	adaptiveCache := cache.NewAdaptiveCache()
 
-	// Goroutine background:
-	//   1. AutoCleanup          → hapus entry kadaluarsa setiap 1 menit
-	//   2. MonthlyEvaluationCycle → re-kalibrasi TTL_baseline tiap pergantian bulan
-	go adaptiveCache.AutoCleanup()
-	go adaptiveCache.MonthlyEvaluationCycle()
-
-	// ── Handler & Router ─────────────────────────────────────────────────
+	// ── Handler (mendaftarkan WarmupFunc ke cache) ─────────────────────────
+	// NewProductHandler secara otomatis memanggil RegisterWarmupFunc,
+	// sehingga WarmupScheduler tahu cara mengambil data dari DB.
 	productHandler := handlers.NewProductHandler(database, adaptiveCache)
 
+	// ── Goroutine Background ───────────────────────────────────────────────
+	// 1. AutoCleanup         → hapus entry kadaluarsa setiap 1 menit
+	// 2. MonthlyEvaluationCycle → evaluasi tiga pilar setiap pergantian bulan
+	// 3. WarmupScheduler     → cek jadwal pre-warm setiap 1 menit (Pilar 1)
+	go adaptiveCache.AutoCleanup()
+	go adaptiveCache.MonthlyEvaluationCycle()
+	go adaptiveCache.WarmupScheduler()
+
+	// ── Gin Router ─────────────────────────────────────────────────────────
 	if getEnv("GIN_MODE", "debug") == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -57,36 +67,49 @@ func main() {
 	r.Use(corsMiddleware())
 	r.Use(requestTimingMiddleware())
 
-	// Root: info sistem
 	r.GET("/", func(c *gin.Context) {
 		stats := adaptiveCache.GetStats()
 		c.JSON(200, gin.H{
-			"app":       "RESTful API dengan Auto-Cache Adaptif",
-			"version":   "2.0.0",
-			"framework": "Gin v1.9.1",
-			"database":  "SQLite",
-			"cache": gin.H{
-				"type":          "In-Memory Adaptive Cache",
+			"app":     "RESTful API Auto-Cache Adaptif",
+			"version": "3.0.0",
+			"tiga_pilar": gin.H{
+				"pilar_1_akses_awal": gin.H{
+					"fungsi": "Catat jam pertama key diakses tiap hari",
+					"efek":   "Bulan depan, cache di-pre-warm otomatis pada jam yang sama",
+					"contoh": "Jika products:all selalu pertama diakses pukul 06:30 → bulan depan auto-warm pukul 06:30",
+				},
+				"pilar_2_cache_hit": gin.H{
+					"fungsi": "Hitung berapa kali setiap key di-hit",
+					"efek":   "Hanya key dengan hit > 0 yang menjadi hot key bulan depan",
+					"contoh": "products:all hit 500x, products:id:3 hit 2x → keduanya hot key bulan depan",
+				},
+				"pilar_3_durasi": gin.H{
+					"fungsi": "Hitung durasi aktif key (LastAccess − FirstAccess) bulan ini",
+					"efek":   "Durasi ini menjadi SuggestedTTL key tersebut di bulan berikutnya",
+					"contoh": "products:all aktif dari 06:30 sampai 23:00 = 16.5 jam → TTL bulan depan 16.5 jam",
+				},
+			},
+			"status": gin.H{
+				"bulan_aktif":   stats.CurrentMonth,
+				"item_di_cache": stats.ItemCount,
+				"total_hits":    stats.TotalHits,
+				"hit_ratio":     stats.HitRatioPct,
+				"hot_keys":      len(stats.HotKeyProfiles),
 				"ttl_baseline":  stats.TTLBaselineSec,
-				"ttl_max":       stats.TTLMaxSec,
-				"adapt_coeff":   stats.AdaptCoeff,
-				"eval_trigger":  "Setiap pergantian bulan",
-				"current_month": stats.CurrentMonth,
-				"next_eval":     stats.NextEvalEstimate,
 			},
 			"endpoints": gin.H{
-				"GET    /api/products":           "Ambil semua produk (cache-first)",
-				"GET    /api/products/:id":       "Ambil produk by ID (cache-first)",
-				"POST   /api/products":           "Tambah produk (invalidasi cache)",
-				"PUT    /api/products/:id":       "Update produk (invalidasi cache)",
-				"DELETE /api/products/:id":       "Hapus produk (invalidasi cache)",
-				"GET    /api/cache/stats":        "Statistik cache adaptif + riwayat bulanan",
-				"POST   /api/cache/trigger-eval": "Paksa evaluasi bulanan sekarang (untuk testing)",
+				"GET    /api/products":             "Ambil semua produk (cache-first)",
+				"GET    /api/products/:id":         "Ambil produk by ID (cache-first)",
+				"POST   /api/products":             "Tambah produk (invalidasi cache)",
+				"PUT    /api/products/:id":         "Update produk (invalidasi cache)",
+				"DELETE /api/products/:id":         "Hapus produk (invalidasi cache)",
+				"GET    /api/cache/stats":          "Statistik + profil hot key + riwayat evaluasi",
+				"POST   /api/cache/trigger-eval":   "Paksa evaluasi bulanan sekarang (testing)",
+				"POST   /api/cache/trigger-warmup": "Paksa pre-warm semua hot key sekarang (testing)",
 			},
 		})
 	})
 
-	// Grup /api
 	api := r.Group("/api")
 	{
 		products := api.Group("/products")
@@ -97,19 +120,16 @@ func main() {
 			products.PUT("/:id", productHandler.Update)
 			products.DELETE("/:id", productHandler.Delete)
 		}
-
 		cacheGroup := api.Group("/cache")
 		{
 			cacheGroup.GET("/stats", productHandler.CacheStats)
 			cacheGroup.POST("/trigger-eval", productHandler.TriggerEval)
+			cacheGroup.POST("/trigger-warmup", productHandler.TriggerWarmup)
 		}
 	}
 
-	// Jalankan server
 	port := getEnv("PORT", "8081")
 	log.Printf("Server berjalan di http://localhost:%s", port)
-	log.Printf("Evaluasi TTL_baseline akan dijalankan otomatis setiap pergantian bulan.")
-	log.Println("Gunakan POST /api/cache/trigger-eval untuk simulasi evaluasi sekarang.")
 	log.Println("────────────────────────────────────────────────────────────────────")
 
 	if err := r.Run(":" + port); err != nil {
@@ -134,8 +154,7 @@ func requestTimingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
-		duration := time.Since(start)
-		c.Header("X-Response-Time", duration.String())
+		c.Header("X-Response-Time", time.Since(start).String())
 	}
 }
 

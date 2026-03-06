@@ -1,16 +1,12 @@
 // Package handlers berisi HTTP handler untuk setiap endpoint API.
-// Setiap handler menerapkan strategi cache-first:
-//  1. Cek cache → jika HIT, kembalikan dari cache (TTL diperbarui adaptif)
-//  2. Jika MISS, ambil dari database → simpan ke cache → kembalikan ke client
-//
-// Saat operasi CUD (Create/Update/Delete), cache terkait di-invalidasi
-// untuk menjaga konsistensi data.
+// Mendaftarkan WarmupFunc ke cache agar pre-warming otomatis dapat berjalan.
 package handlers
 
 import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"smart-api/background/cache"
 	"smart-api/background/db"
@@ -19,14 +15,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ── Konstanta Kunci Cache ──────────────────────────────────────────────────────
-
 const (
 	cacheKeyAllProducts = "products:all"
 	cacheKeyProductByID = "products:id:%d"
 )
-
-// ── Handler ────────────────────────────────────────────────────────────────────
 
 // ProductHandler menyatukan dependency database dan cache adaptif.
 type ProductHandler struct {
@@ -34,17 +26,41 @@ type ProductHandler struct {
 	cache *cache.AdaptiveCache
 }
 
-// NewProductHandler membuat ProductHandler baru.
+// NewProductHandler membuat ProductHandler dan mendaftarkan WarmupFunc.
+// WarmupFunc ini yang akan dipanggil secara otomatis oleh WarmupScheduler
+// saat jam pre-warm tiba (Pilar 1).
 func NewProductHandler(d *db.DB, c *cache.AdaptiveCache) *ProductHandler {
-	return &ProductHandler{db: d, cache: c}
+	h := &ProductHandler{db: d, cache: c}
+
+	// Daftarkan fungsi pre-warm ke cache.
+	// Cache akan memanggil fungsi ini secara otomatis saat jam yang tepat.
+	c.RegisterWarmupFunc(func(key string) (interface{}, error) {
+		return h.fetchByKey(key)
+	})
+
+	return h
 }
 
-// ── GET /api/products ──────────────────────────────────────────────────────────
+// fetchByKey mengambil data dari database berdasarkan cache key.
+// Dipanggil oleh WarmupScheduler saat pre-warm otomatis.
+func (h *ProductHandler) fetchByKey(key string) (interface{}, error) {
+	if key == cacheKeyAllProducts {
+		return h.db.GetAllProducts()
+	}
 
-// GetAll mengambil seluruh produk.
-// Prioritas: cache → database.
+	// Coba parse sebagai key by-ID
+	var id int64
+	_, err := fmt.Sscanf(key, "products:id:%d", &id)
+	if err == nil && id > 0 {
+		return h.db.GetProductByID(id)
+	}
+
+	return nil, fmt.Errorf("key tidak dikenali: %s", key)
+}
+
+// ── GET /api/products ────────────────────────────────────────────────────────
+
 func (h *ProductHandler) GetAll(c *gin.Context) {
-	// 1. Cek cache
 	if cached, ok := h.cache.Get(cacheKeyAllProducts); ok {
 		c.JSON(http.StatusOK, gin.H{
 			"source":  "cache",
@@ -54,14 +70,12 @@ func (h *ProductHandler) GetAll(c *gin.Context) {
 		return
 	}
 
-	// 2. Cache miss → query database
 	products, err := h.db.GetAllProducts()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data produk"})
 		return
 	}
 
-	// 3. Simpan ke cache dengan TTL awal
 	h.cache.Set(cacheKeyAllProducts, products)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -71,10 +85,8 @@ func (h *ProductHandler) GetAll(c *gin.Context) {
 	})
 }
 
-// ── GET /api/products/:id ──────────────────────────────────────────────────────
+// ── GET /api/products/:id ────────────────────────────────────────────────────
 
-// GetByID mengambil satu produk berdasarkan ID.
-// Prioritas: cache → database.
 func (h *ProductHandler) GetByID(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -83,7 +95,6 @@ func (h *ProductHandler) GetByID(c *gin.Context) {
 
 	cacheKey := fmt.Sprintf(cacheKeyProductByID, id)
 
-	// 1. Cek cache
 	if cached, ok := h.cache.Get(cacheKey); ok {
 		c.JSON(http.StatusOK, gin.H{
 			"source":  "cache",
@@ -93,14 +104,14 @@ func (h *ProductHandler) GetByID(c *gin.Context) {
 		return
 	}
 
-	// 2. Cache miss → query database
 	product, err := h.db.GetProductByID(id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id)})
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id),
+		})
 		return
 	}
 
-	// 3. Simpan ke cache
 	h.cache.Set(cacheKey, product)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -110,9 +121,8 @@ func (h *ProductHandler) GetByID(c *gin.Context) {
 	})
 }
 
-// ── POST /api/products ─────────────────────────────────────────────────────────
+// ── POST /api/products ───────────────────────────────────────────────────────
 
-// Create menambahkan produk baru dan menginvalidasi cache daftar produk.
 func (h *ProductHandler) Create(c *gin.Context) {
 	var req models.CreateProductRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -123,17 +133,12 @@ func (h *ProductHandler) Create(c *gin.Context) {
 		return
 	}
 
-	product := &models.Product{
-		Name:  req.Name,
-		Price: req.Price,
-	}
-
+	product := &models.Product{Name: req.Name, Price: req.Price}
 	if err := h.db.CreateProduct(product); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan produk baru"})
 		return
 	}
 
-	// Invalidasi cache daftar produk (data berubah)
 	h.cache.Delete(cacheKeyAllProducts)
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -142,16 +147,14 @@ func (h *ProductHandler) Create(c *gin.Context) {
 	})
 }
 
-// ── PUT /api/products/:id ──────────────────────────────────────────────────────
+// ── PUT /api/products/:id ────────────────────────────────────────────────────
 
-// Update memperbarui produk berdasarkan ID dan menginvalidasi cache terkait.
 func (h *ProductHandler) Update(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
 		return
 	}
 
-	// Cek apakah produk ada
 	if !h.db.ProductExists(id) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id),
@@ -173,30 +176,23 @@ func (h *ProductHandler) Update(c *gin.Context) {
 		return
 	}
 
-	// Invalidasi cache daftar dan cache produk individual
 	h.cache.Delete(cacheKeyAllProducts)
 	h.cache.Delete(fmt.Sprintf(cacheKeyProductByID, id))
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Produk berhasil diperbarui",
-		"data": models.Product{
-			ID:    id,
-			Name:  req.Name,
-			Price: req.Price,
-		},
+		"data":    models.Product{ID: id, Name: req.Name, Price: req.Price},
 	})
 }
 
-// ── DELETE /api/products/:id ───────────────────────────────────────────────────
+// ── DELETE /api/products/:id ─────────────────────────────────────────────────
 
-// Delete menghapus produk berdasarkan ID dan membersihkan cache terkait.
 func (h *ProductHandler) Delete(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
 		return
 	}
 
-	// Cek apakah produk ada sebelum menghapus
 	if !h.db.ProductExists(id) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id),
@@ -209,7 +205,6 @@ func (h *ProductHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	// Invalidasi cache terkait produk yang dihapus
 	h.cache.Delete(cacheKeyAllProducts)
 	h.cache.Delete(fmt.Sprintf(cacheKeyProductByID, id))
 
@@ -219,42 +214,51 @@ func (h *ProductHandler) Delete(c *gin.Context) {
 	})
 }
 
-// ── GET /api/cache/stats ───────────────────────────────────────────────────────
+// ── GET /api/cache/stats ─────────────────────────────────────────────────────
 
-// CacheStats menampilkan statistik lengkap mekanisme auto-cache adaptif,
-// termasuk status jendela waktu aktif dan klasifikasi frekuensi per-key.
 func (h *ProductHandler) CacheStats(c *gin.Context) {
 	stats := h.cache.GetStats()
 	c.JSON(http.StatusOK, gin.H{
-		"message":     "Statistik auto-cache adaptif",
+		"message":     "Statistik Auto-Cache Adaptif — Tiga Pilar",
+		"pilar_1":     "Akses awal: jam pertama pengguna mengakses tiap hari → jadwal pre-warm bulan depan",
+		"pilar_2":     "Cache hit: hanya key yang pernah di-hit yang menjadi hot key bulan depan",
+		"pilar_3":     "Durasi cache: LastAccess − FirstAccess bulan ini → TTL key tersebut bulan depan",
 		"cache_stats": stats,
-		"description": map[string]string{
-			"item_count":                 "Jumlah item aktif di cache saat ini",
-			"total_hits":                 "Total request yang dilayani dari cache",
-			"total_misses":               "Total request yang diteruskan ke database",
-			"hit_ratio_pct":              "Persentase hit (makin tinggi = makin efisien)",
-			"ttl_baseline_seconds":       "TTL_baseline global (berubah tiap siklus evaluasi)",
-			"ttl_max_seconds":            "Batas maksimum TTL yang diizinkan",
-			"adapt_coeff":                "Koefisien f(D): per detik D, TTL bertambah nilai ini",
-			"active_window_start":        "Jam cache mulai aktif",
-			"active_window_end":          "Jam cache berhenti aktif",
-			"is_window_active_now":       "Apakah cache sedang aktif sekarang?",
-			"window_status":              "Deskripsi status jendela aktif",
-			"entries_cleaned_this_cycle": "Jumlah entry kadaluarsa dibersihkan siklus ini",
-			"cycle_start_t0":             "Waktu awal siklus evaluasi (t0)",
-			"last_eval_time":             "Waktu evaluasi siklus terakhir",
-			"next_eval_time":             "Estimasi evaluasi siklus berikutnya",
-			"key_stats":                  "Statistik per-key: hit, miss, class, TTL ditetapkan",
-			"high_freq_keys":             "Key frekuensi TINGGI: TTL diperpanjang x3",
-			"low_freq_keys":              "Key frekuensi RENDAH: TTL dipersingkat x0.5",
-			"skipped_keys":               "Key yang diskip dari cache karena frekuensi sangat rendah",
-		},
+	})
+}
+
+// ── POST /api/cache/trigger-eval ─────────────────────────────────────────────
+
+func (h *ProductHandler) TriggerEval(c *gin.Context) {
+	before := h.cache.GetStats()
+	h.cache.TriggerEvaluationNow()
+	after := h.cache.GetStats()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":          "Evaluasi bulanan dipicu secara manual",
+		"hot_keys_sebelum": len(before.HotKeyProfiles),
+		"hot_keys_sesudah": len(after.HotKeyProfiles),
+		"hot_key_profiles": after.HotKeyProfiles,
+		"triggered_at":     time.Now().Format(time.RFC3339),
+	})
+}
+
+// ── POST /api/cache/trigger-warmup ───────────────────────────────────────────
+
+// TriggerWarmup memaksa pre-warming semua hot key sekarang (untuk testing).
+func (h *ProductHandler) TriggerWarmup(c *gin.Context) {
+	h.cache.TriggerWarmupNow()
+	stats := h.cache.GetStats()
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "Pre-warming semua hot key dipicu secara manual",
+		"item_in_cache": stats.ItemCount,
+		"hot_keys":      stats.HotKeyProfiles,
+		"triggered_at":  time.Now().Format(time.RFC3339),
 	})
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
-// parseID mem-parse parameter :id dari URL dan menulis error response jika gagal.
 func parseID(c *gin.Context) (int64, error) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
