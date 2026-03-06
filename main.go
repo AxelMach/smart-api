@@ -1,30 +1,13 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  RESTFUL API PINTAR - AUTO-CACHE ADAPTIF                                ║
+// ║  RESTFUL API — AUTO-CACHE ADAPTIF (EVALUASI PERGANTIAN BULAN)           ║
 // ║  Golang + Gin Framework + SQLite                                         ║
-// ║  Oleh: Dita Aulia Al Farid (2109020178)                                  ║
-// ║  Universitas Muhammadiyah Sumatera Utara - 2026                          ║
+// ║                                                                          ║
+// ║  Algoritma:                                                              ║
+// ║    TTL_runtime = TTL_baseline + AdaptCoeff × (TLast − T0)               ║
+// ║    Saat bulan berganti:                                                  ║
+// ║      D_avg = rata-rata (TLast−T0) semua entry bulan lalu                ║
+// ║      TTL_baseline_baru = TTL_baseline_lama + AdaptCoeff × D_avg         ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-//
-// Alur sistem (sesuai rancangan Bab III):
-//
-//  Client Request
-//      │
-//      ▼
-//  [Gin Router] ──► [Handler]
-//                       │
-//                 ┌─────▼──────┐
-//                 │ Cache Check │
-//                 └─────┬──────┘
-//           HIT ◄───────┴──────► MISS
-//            │                    │
-//     Hitung D = t_now - T0   Query DB
-//     TTL_runtime = baseline    Store to Cache
-//        + f(D)                  (TTL = baseline)
-//     Update t_expire             │
-//            └──────────┬─────────┘
-//                       ▼
-//                   JSON Response
-
 package main
 
 import (
@@ -40,78 +23,72 @@ import (
 )
 
 func main() {
-	// ── Konfigurasi logging ────────────────────────────────────────────────
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.SetPrefix("[SmartAPI] ")
-	log.Println("=== RESTful API Pintar dengan Auto-Cache Adaptif ===")
-	log.Println("Menggunakan: Golang + Gin Framework + SQLite")
-	log.Println("Algoritma: TTL_runtime = TTL_baseline + f(D), D = t_now - T0")
+	log.SetPrefix("[API] ")
+	log.Println("=== RESTful API dengan Auto-Cache Adaptif (Evaluasi per Bulan) ===")
 
-	// ── Inisialisasi Database ──────────────────────────────────────────────
+	// ── Database ─────────────────────────────────────────────────────────
 	dbPath := getEnv("DB_PATH", "./products.db")
 	database, err := db.InitDB(dbPath)
 	if err != nil {
-		log.Fatalf("FATAL: Gagal menginisialisasi database: %v", err)
+		log.Fatalf("FATAL: Gagal inisialisasi database: %v", err)
 	}
 	defer database.Close()
 
-	// ── Inisialisasi Cache Adaptif ─────────────────────────────────────────
+	// ── Cache Adaptif ─────────────────────────────────────────────────────
 	adaptiveCache := cache.NewAdaptiveCache()
 
-	// Jalankan goroutine background:
-	//   1. AutoCleanup  → hapus entry kadaluarsa setiap 1 menit
-	//   2. EvaluationCycle → re-kalibrasi TTL_baseline setiap 30 hari
+	// Goroutine background:
+	//   1. AutoCleanup          → hapus entry kadaluarsa setiap 1 menit
+	//   2. MonthlyEvaluationCycle → re-kalibrasi TTL_baseline tiap pergantian bulan
 	go adaptiveCache.AutoCleanup()
-	go adaptiveCache.EvaluationCycle()
+	go adaptiveCache.MonthlyEvaluationCycle()
 
-	// ── Inisialisasi Handler ───────────────────────────────────────────────
+	// ── Handler & Router ─────────────────────────────────────────────────
 	productHandler := handlers.NewProductHandler(database, adaptiveCache)
 
-	// ── Setup Gin Router ───────────────────────────────────────────────────
 	if getEnv("GIN_MODE", "debug") == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	r := gin.New()
-
-	// Middleware
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
 	r.Use(corsMiddleware())
 	r.Use(requestTimingMiddleware())
 
-	// ── Endpoint Root: Info Sistem ─────────────────────────────────────────
+	// Root: info sistem
 	r.GET("/", func(c *gin.Context) {
-		cacheStats := adaptiveCache.GetStats()
+		stats := adaptiveCache.GetStats()
 		c.JSON(200, gin.H{
-			"app":          "RESTful API Pintar dengan Auto-Cache Adaptif",
-			"version":      "1.0.0",
-			"framework":    "Gin v1.9.1",
-			"database":     "SQLite (modernc.org/sqlite)",
-			"cache_engine": "Custom In-Memory Adaptive Cache",
-			"algorithm": gin.H{
-				"formula":      "TTL_runtime = TTL_baseline + AdaptCoeff × D",
-				"D":            "Durasi entry di cache (detik)",
-				"ttl_baseline": cacheStats.TTLBaselineSec,
-				"ttl_max":      cacheStats.TTLMaxSec,
-				"adapt_coeff":  cacheStats.AdaptCoeff,
-				"eval_cycle":   "30 hari",
+			"app":       "RESTful API dengan Auto-Cache Adaptif",
+			"version":   "2.0.0",
+			"framework": "Gin v1.9.1",
+			"database":  "SQLite",
+			"cache": gin.H{
+				"type":          "In-Memory Adaptive Cache",
+				"ttl_baseline":  stats.TTLBaselineSec,
+				"ttl_max":       stats.TTLMaxSec,
+				"adapt_coeff":   stats.AdaptCoeff,
+				"eval_trigger":  "Setiap pergantian bulan",
+				"current_month": stats.CurrentMonth,
+				"next_eval":     stats.NextEvalEstimate,
 			},
 			"endpoints": gin.H{
-				"GET    /api/products":     "Ambil semua produk (cache-first)",
-				"GET    /api/products/:id": "Ambil produk by ID (cache-first)",
-				"POST   /api/products":     "Tambah produk baru (invalidasi cache)",
-				"PUT    /api/products/:id": "Update produk (invalidasi cache)",
-				"DELETE /api/products/:id": "Hapus produk (invalidasi cache)",
-				"GET    /api/cache/stats":  "Statistik auto-cache adaptif",
+				"GET    /api/products":           "Ambil semua produk (cache-first)",
+				"GET    /api/products/:id":       "Ambil produk by ID (cache-first)",
+				"POST   /api/products":           "Tambah produk (invalidasi cache)",
+				"PUT    /api/products/:id":       "Update produk (invalidasi cache)",
+				"DELETE /api/products/:id":       "Hapus produk (invalidasi cache)",
+				"GET    /api/cache/stats":        "Statistik cache adaptif + riwayat bulanan",
+				"POST   /api/cache/trigger-eval": "Paksa evaluasi bulanan sekarang (untuk testing)",
 			},
 		})
 	})
 
-	// ── Grup Endpoint API ──────────────────────────────────────────────────
+	// Grup /api
 	api := r.Group("/api")
 	{
-		// Endpoint Produk (CRUD + Cache Adaptif)
 		products := api.Group("/products")
 		{
 			products.GET("", productHandler.GetAll)
@@ -121,24 +98,25 @@ func main() {
 			products.DELETE("/:id", productHandler.Delete)
 		}
 
-		// Endpoint Statistik Cache
-		api.GET("/cache/stats", productHandler.CacheStats)
+		cacheGroup := api.Group("/cache")
+		{
+			cacheGroup.GET("/stats", productHandler.CacheStats)
+			cacheGroup.POST("/trigger-eval", productHandler.TriggerEval)
+		}
 	}
 
-	// ── Jalankan Server ────────────────────────────────────────────────────
-	port := getEnv("PORT", "8080")
+	// Jalankan server
+	port := getEnv("PORT", "8081")
 	log.Printf("Server berjalan di http://localhost:%s", port)
-	log.Printf("Tekan Ctrl+C untuk menghentikan server.")
-	log.Println("─────────────────────────────────────────────────")
+	log.Printf("Evaluasi TTL_baseline akan dijalankan otomatis setiap pergantian bulan.")
+	log.Println("Gunakan POST /api/cache/trigger-eval untuk simulasi evaluasi sekarang.")
+	log.Println("────────────────────────────────────────────────────────────────────")
 
 	if err := r.Run(":" + port); err != nil {
-		log.Fatalf("FATAL: Gagal menjalankan server: %v", err)
+		log.Fatalf("FATAL: %v", err)
 	}
 }
 
-// ── Middleware ─────────────────────────────────────────────────────────────────
-
-// corsMiddleware menambahkan header CORS agar API dapat diakses dari browser.
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
@@ -152,25 +130,15 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-// requestTimingMiddleware mencatat waktu pemrosesan setiap request.
 func requestTimingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
 		duration := time.Since(start)
 		c.Header("X-Response-Time", duration.String())
-		log.Printf("%-6s %-30s → %d [%v]",
-			c.Request.Method,
-			c.Request.URL.Path,
-			c.Writer.Status(),
-			duration,
-		)
 	}
 }
 
-// ── Utility ────────────────────────────────────────────────────────────────────
-
-// getEnv mengambil nilai environment variable, atau fallback ke defaultVal.
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val

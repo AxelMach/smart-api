@@ -221,27 +221,33 @@ func (h *ProductHandler) Delete(c *gin.Context) {
 
 // ── GET /api/cache/stats ───────────────────────────────────────────────────────
 
-// CacheStats menampilkan statistik lengkap mekanisme auto-cache adaptif.
-// Endpoint ini digunakan untuk menganalisis kinerja sistem caching.
+// CacheStats menampilkan statistik lengkap mekanisme auto-cache adaptif,
+// termasuk status jendela waktu aktif dan klasifikasi frekuensi per-key.
 func (h *ProductHandler) CacheStats(c *gin.Context) {
 	stats := h.cache.GetStats()
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "Statistik auto-cache adaptif",
 		"cache_stats": stats,
 		"description": map[string]string{
-			"item_count":                 "Jumlah item aktif di cache",
-			"total_hits":                 "Total permintaan yang dilayani cache",
-			"total_misses":               "Total permintaan yang harus ke database",
-			"hit_ratio_pct":              "Persentase cache hit (semakin tinggi = makin efisien)",
-			"avg_entry_duration_seconds": "Rata-rata usia entry aktif (detik)",
-			"avg_active_ttl_seconds":     "Rata-rata sisa TTL entry aktif (detik)",
-			"ttl_baseline_seconds":       "Nilai TTL_baseline saat ini",
+			"item_count":                 "Jumlah item aktif di cache saat ini",
+			"total_hits":                 "Total request yang dilayani dari cache",
+			"total_misses":               "Total request yang diteruskan ke database",
+			"hit_ratio_pct":              "Persentase hit (makin tinggi = makin efisien)",
+			"ttl_baseline_seconds":       "TTL_baseline global (berubah tiap siklus evaluasi)",
 			"ttl_max_seconds":            "Batas maksimum TTL yang diizinkan",
-			"adapt_coeff":                "Koefisien fungsi adaptasi f(D)",
-			"entries_cleaned_this_cycle": "Jumlah entry yang dibersihkan dalam siklus 30 hari ini",
-			"cycle_start_t0":             "Waktu awal siklus evaluasi (t₀)",
+			"adapt_coeff":                "Koefisien f(D): per detik D, TTL bertambah nilai ini",
+			"active_window_start":        "Jam cache mulai aktif",
+			"active_window_end":          "Jam cache berhenti aktif",
+			"is_window_active_now":       "Apakah cache sedang aktif sekarang?",
+			"window_status":              "Deskripsi status jendela aktif",
+			"entries_cleaned_this_cycle": "Jumlah entry kadaluarsa dibersihkan siklus ini",
+			"cycle_start_t0":             "Waktu awal siklus evaluasi (t0)",
 			"last_eval_time":             "Waktu evaluasi siklus terakhir",
-			"next_eval_time":             "Estimasi waktu evaluasi siklus berikutnya",
+			"next_eval_time":             "Estimasi evaluasi siklus berikutnya",
+			"key_stats":                  "Statistik per-key: hit, miss, class, TTL ditetapkan",
+			"high_freq_keys":             "Key frekuensi TINGGI: TTL diperpanjang x3",
+			"low_freq_keys":              "Key frekuensi RENDAH: TTL dipersingkat x0.5",
+			"skipped_keys":               "Key yang diskip dari cache karena frekuensi sangat rendah",
 		},
 	})
 }
