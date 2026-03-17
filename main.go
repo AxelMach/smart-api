@@ -1,18 +1,3 @@
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  RESTFUL API — AUTO-CACHE ADAPTIF (TIGA PILAR)                          ║
-// ║  Golang + Gin Framework + SQLite                                         ║
-// ╠══════════════════════════════════════════════════════════════════════════╣
-// ║  PILAR 1 — Akses Awal                                                    ║
-// ║    Catat jam pertama setiap key diakses tiap hari.                       ║
-// ║    Bulan depan: pre-warm otomatis pada jam yang sama.                    ║
-// ║                                                                          ║
-// ║  PILAR 2 — Cache Hit                                                     ║
-// ║    Hanya key yang pernah di-hit yang menjadi hot key bulan depan.        ║
-// ║                                                                          ║
-// ║  PILAR 3 — Durasi Cache                                                  ║
-// ║    Durasi aktif bulan ini (LastAccess − FirstAccess) menjadi             ║
-// ║    SuggestedTTL key tersebut di bulan berikutnya.                        ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
 package main
 
 import (
@@ -48,10 +33,7 @@ func main() {
 	// sehingga WarmupScheduler tahu cara mengambil data dari DB.
 	productHandler := handlers.NewProductHandler(database, adaptiveCache)
 
-	// ── Goroutine Background ───────────────────────────────────────────────
-	// 1. AutoCleanup         → hapus entry kadaluarsa setiap 1 menit
-	// 2. MonthlyEvaluationCycle → evaluasi tiga pilar setiap pergantian bulan
-	// 3. WarmupScheduler     → cek jadwal pre-warm setiap 1 menit (Pilar 1)
+	// ── Goroutine untuk tugas background cache adaptif ─────────────────────
 	go adaptiveCache.AutoCleanup()
 	go adaptiveCache.MonthlyEvaluationCycle()
 	go adaptiveCache.WarmupScheduler()
