@@ -84,21 +84,19 @@ type WarmupFunc func(key string) (interface{}, error)
 
 // dailyRecord mencatat aktivitas satu key pada satu hari tertentu.
 type dailyRecord struct {
-	Date      string    // format: "2006-01-02"
-	FirstTime time.Time // jam pertama kali key ini diakses hari itu (Pilar 1)
-	LastTime  time.Time // jam terakhir key ini diakses hari itu
-	Hits      int64     // jumlah hit hari ini
+	Date      string
+	FirstTime time.Time
+	LastTime  time.Time
+	Hits      int64
 }
-
-// keyMonthlyStats mengumpulkan statistik satu key selama satu bulan penuh.
 type keyMonthlyStats struct {
 	Key             string
 	Month           int
 	Year            int
-	FirstAccessEver time.Time               // akses pertama key ini bulan ini
-	LastAccessEver  time.Time               // akses terakhir key ini bulan ini
-	TotalHits       int64                   // total hit bulan ini (Pilar 2)
-	DailyRecords    map[string]*dailyRecord // key: "2006-01-02" (Pilar 1 per hari)
+	FirstAccessEver time.Time
+	LastAccessEver  time.Time
+	TotalHits       int64
+	DailyRecords    map[string]*dailyRecord
 }
 
 // HotKeyProfile adalah hasil evaluasi bulanan untuk satu key.
@@ -235,7 +233,6 @@ func (c *AdaptiveCache) RegisterWarmupFunc(fn WarmupFunc) {
 func (c *AdaptiveCache) computeKeyTTL(key string, stats *keyMonthlyStats) time.Duration {
 	baseline := c.TTLBaseline
 
-	// Jika key ini adalah hot key dari bulan lalu, gunakan SuggestedTTL-nya
 	if profile, isHot := c.hotKeyProfiles[key]; isHot {
 		if profile.SuggestedTTL > baseline {
 			baseline = profile.SuggestedTTL
@@ -244,7 +241,6 @@ func (c *AdaptiveCache) computeKeyTTL(key string, stats *keyMonthlyStats) time.D
 		}
 	}
 
-	// Pilar 3: hitung durasi aktif key bulan ini
 	var D_key time.Duration
 	if !stats.FirstAccessEver.IsZero() && !stats.LastAccessEver.IsZero() {
 		D_key = stats.LastAccessEver.Sub(stats.FirstAccessEver)
@@ -279,7 +275,6 @@ func (c *AdaptiveCache) Get(key string) (interface{}, bool) {
 
 	now := time.Now()
 
-	// Cek kadaluarsa
 	if now.After(entry.ExpireAt) {
 		delete(c.items, key)
 		c.CleanupCount++
@@ -287,19 +282,16 @@ func (c *AdaptiveCache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
-	// ── Cache HIT ──
 	c.TotalHits++
 	stats := entry.stats
 
-	// PILAR 2: Tambah HitCount
 	stats.TotalHits++
 
-	// PILAR 1: Catat jam akses pertama hari ini
 	today := now.Format("2006-01-02")
 	if _, exists := stats.DailyRecords[today]; !exists {
 		stats.DailyRecords[today] = &dailyRecord{
 			Date:      today,
-			FirstTime: now, // ← JAM PERTAMA akses hari ini (Pilar 1)
+			FirstTime: now,
 			LastTime:  now,
 			Hits:      1,
 		}
@@ -310,10 +302,8 @@ func (c *AdaptiveCache) Get(key string) (interface{}, bool) {
 		stats.DailyRecords[today].Hits++
 	}
 
-	// PILAR 3: Perbarui LastAccessEver → perpanjang durasi aktif
 	stats.LastAccessEver = now
 
-	// Hitung ulang TTL berdasarkan durasi aktif key ini
 	newTTL := c.computeKeyTTL(key, stats)
 	entry.ExpireAt = now.Add(newTTL)
 
@@ -337,7 +327,6 @@ func (c *AdaptiveCache) Set(key string, value interface{}) {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
-	// Entry sudah ada → update value saja, pertahankan stats
 	if existing, ok := c.items[key]; ok {
 		existing.Value = value
 		newTTL := c.computeKeyTTL(key, existing.stats)
@@ -346,7 +335,6 @@ func (c *AdaptiveCache) Set(key string, value interface{}) {
 		return
 	}
 
-	// Entry baru → buat stats baru, gunakan TTL dari profil hot key jika ada
 	stats := &keyMonthlyStats{
 		Key:             key,
 		Month:           c.currentMonth,
@@ -364,7 +352,6 @@ func (c *AdaptiveCache) Set(key string, value interface{}) {
 		},
 	}
 
-	// Tentukan TTL awal
 	ttl := c.TTLBaseline
 	if profile, isHot := c.hotKeyProfiles[key]; isHot {
 		if profile.SuggestedTTL > ttl {
@@ -471,7 +458,6 @@ func (c *AdaptiveCache) runMonthlyEvaluation(now time.Time) {
 		monthLabel(now.Year(), int(now.Month())),
 	)
 
-	// Kumpulkan semua stats dari entry aktif
 	allStats := []*keyMonthlyStats{}
 	for _, entry := range c.items {
 		if entry.stats != nil && entry.stats.Month == prevMonth && entry.stats.Year == prevYear {
@@ -479,24 +465,20 @@ func (c *AdaptiveCache) runMonthlyEvaluation(now time.Time) {
 		}
 	}
 
-	// Bangun hot key profiles baru
 	newProfiles := make(map[string]*HotKeyProfile)
 	snapshots := []HotKeyProfile{}
 
 	for _, stats := range allStats {
-		// PILAR 2: Hanya key yang pernah di-hit
 		if stats.TotalHits == 0 {
 			log.Printf("[Cache Eval] key=%q dilewati (tidak ada hit bulan ini)", stats.Key)
 			continue
 		}
 
-		// PILAR 1: Hitung rata-rata jam & menit akses pertama harian
 		avgHour, avgMinute := computeAvgFirstAccess(stats.DailyRecords)
 
-		// PILAR 3: SuggestedTTL = durasi aktif (LastAccess − FirstAccess)
 		activeDuration := stats.LastAccessEver.Sub(stats.FirstAccessEver)
 		if activeDuration < c.TTLBaseline {
-			activeDuration = c.TTLBaseline // minimal TTL_baseline
+			activeDuration = c.TTLBaseline
 		}
 		if activeDuration > c.TTLMax {
 			activeDuration = c.TTLMax
