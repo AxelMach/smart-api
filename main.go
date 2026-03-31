@@ -96,8 +96,8 @@ func main() {
 	{
 		products := api.Group("/products")
 		{
-			//			products.GET("", productHandler.GetAll)
-			//			products.GET("/:id", productHandler.GetByID)
+			products.GET("", productHandler.GetAll)
+			products.GET("/:id", productHandler.GetByID)
 			products.POST("", productHandler.Create)
 			products.PUT("/:id", productHandler.Update)
 			products.DELETE("/:id", productHandler.Delete)
