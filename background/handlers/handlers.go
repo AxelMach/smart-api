@@ -60,66 +60,66 @@ func (h *ProductHandler) fetchByKey(key string) (interface{}, error) {
 
 // ── GET /api/products ────────────────────────────────────────────────────────
 
-func (h *ProductHandler) GetAll(c *gin.Context) {
-	if cached, ok := h.cache.Get(cacheKeyAllProducts); ok {
-		c.JSON(http.StatusOK, gin.H{
-			"source":  "cache",
-			"message": "Data diambil dari cache adaptif",
-			"data":    cached,
-		})
-		return
-	}
+//func (h *ProductHandler) GetAll(c *gin.Context) {
+//	if cached, ok := h.cache.Get(cacheKeyAllProducts); ok {
+//		c.JSON(http.StatusOK, gin.H{
+//			"source":  "cache",
+//			"message": "Data diambil dari cache adaptif",
+//			"data":    cached,
+//		})
+//		return
+//	}
 
-	products, err := h.db.GetAllProducts()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data produk"})
-		return
-	}
+//	products, err := h.db.GetAllProducts()
+//	if err != nil {
+//		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data produk"})
+//		return
+//	}
 
-	h.cache.Set(cacheKeyAllProducts, products)
+//	h.cache.Set(cacheKeyAllProducts, products)
 
-	c.JSON(http.StatusOK, gin.H{
-		"source":  "database",
-		"message": "Data diambil dari database dan disimpan ke cache",
-		"data":    products,
-	})
-}
+//	c.JSON(http.StatusOK, gin.H{
+//		"source":  "database",
+//		"message": "Data diambil dari database dan disimpan ke cache",
+//		"data":    products,
+//	})
+//}
 
 // ── GET /api/products/:id ────────────────────────────────────────────────────
 
-func (h *ProductHandler) GetByID(c *gin.Context) {
-	id, err := parseID(c)
-	if err != nil {
-		return
-	}
+//func (h *ProductHandler) GetByID(c *gin.Context) {
+//	id, err := parseID(c)
+//	if err != nil {
+//		return
+//	}
 
-	cacheKey := fmt.Sprintf(cacheKeyProductByID, id)
+//	cacheKey := fmt.Sprintf(cacheKeyProductByID, id)
 
-	if cached, ok := h.cache.Get(cacheKey); ok {
-		c.JSON(http.StatusOK, gin.H{
-			"source":  "cache",
-			"message": "Data diambil dari cache adaptif",
-			"data":    cached,
-		})
-		return
-	}
+//	if cached, ok := h.cache.Get(cacheKey); ok {
+//		c.JSON(http.StatusOK, gin.H{
+//			"source":  "cache",
+//			"message": "Data diambil dari cache adaptif",
+//			"data":    cached,
+//		})
+//		return
+//	}
 
-	product, err := h.db.GetProductByID(id)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id),
-		})
-		return
-	}
+//	product, err := h.db.GetProductByID(id)
+//	if err != nil {
+//		c.JSON(http.StatusNotFound, gin.H{
+//			"error": fmt.Sprintf("Produk dengan ID %d tidak ditemukan", id),
+//		})
+//		return
+//	}
 
-	h.cache.Set(cacheKey, product)
+//	h.cache.Set(cacheKey, product)
 
-	c.JSON(http.StatusOK, gin.H{
-		"source":  "database",
-		"message": "Data diambil dari database dan disimpan ke cache",
-		"data":    product,
-	})
-}
+//	c.JSON(http.StatusOK, gin.H{
+//		"source":  "database",
+//		"message": "Data diambil dari database dan disimpan ke cache",
+//		"data":    product,
+//	})
+//}
 
 // ── POST /api/products ───────────────────────────────────────────────────────
 
